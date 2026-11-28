@@ -181,10 +181,6 @@ def _interleave_addrinfos(addrinfos, first_address_family_count=1):
     return reordered
 
 
-_run_until_complete_running = contextvars.ContextVar(
-    '_run_until_complete_running', default=True)
-
-
 def _run_until_complete_cb(fut):
     if not fut.cancelled():
         exc = fut.exception()
@@ -192,9 +188,12 @@ def _run_until_complete_cb(fut):
             # Issue #22429: run_forever() already finished, no need to
             # stop it.
             return
-    if not _run_until_complete_running.get():
-        return
-    futures._get_loop(fut).stop()
+    loop = futures._get_loop(fut)
+    # gh-158406: the callback can outlive the run_until_complete() call
+    # that registered it; it must not stop a later run of the loop.
+    current = loop._run_until_complete_fut
+    if current is not None and current.done():
+        loop.stop()
 
 
 if hasattr(socket, 'TCP_NODELAY'):
@@ -431,6 +430,7 @@ class BaseEventLoop(events.AbstractEventLoop):
         self._timer_cancelled_count = 0
         self._closed = False
         self._stopping = False
+        self._run_until_complete_fut = None
         self._ready = collections.deque()
         self._scheduled = []
         self._default_executor = None
@@ -713,12 +713,9 @@ class BaseEventLoop(events.AbstractEventLoop):
             # is no need to log the "destroy pending task" message
             future._log_destroy_pending = False
 
-        # gh-158406: A queued callback can outlive this call. Only let
-        # it stop the loop while this call is running.
-        context = contextvars.copy_context()
-        context.run(_run_until_complete_running.set, True)
+        future.add_done_callback(_run_until_complete_cb)
+        self._run_until_complete_fut = future
         try:
-            future.add_done_callback(_run_until_complete_cb, context=context)
             self.run_forever()
         except:
             if new_task and future.done() and not future.cancelled():
@@ -728,7 +725,7 @@ class BaseEventLoop(events.AbstractEventLoop):
                 future.exception()
             raise
         finally:
-            context.run(_run_until_complete_running.set, False)
+            self._run_until_complete_fut = None
             future.remove_done_callback(_run_until_complete_cb)
         if not future.done():
             raise RuntimeError('Event loop stopped before Future completed.')
